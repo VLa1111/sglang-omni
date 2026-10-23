@@ -300,13 +300,13 @@ std::vector<float> RealtimeSession::SegmentSamples(const Segment &segment,
 }
 
 TranscriptionOptions RealtimeSession::DecodeOptions(Segment &segment,
-                                                    bool reuse_prefix) {
+                                                    bool should_reuse_prefix) {
   TranscriptionOptions options;
   options.language = segment.language;
-  const bool use_prefix =
-      reuse_prefix && segment.decode_count >= kPrefixAfterRefreshCount &&
+  const bool should_use_prefix =
+      should_reuse_prefix && segment.decode_count >= kPrefixAfterRefreshCount &&
       !segment.transcript.empty() && segment.language.has_value();
-  if (use_prefix) {
+  if (should_use_prefix) {
     auto [ids, text] = transcriber_.RetainedPrefix(segment.transcript,
                                                    kPrefixRollbackTokenCount);
     options.prefix_token_ids = std::move(ids);
