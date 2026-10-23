@@ -307,6 +307,250 @@ def test_realtime_manual_session(server: Server) -> None:
     assert indexes == sorted(indexes)
 
 
+def receive_until(socket, event_type: str, timeout: float = 120.0) -> list[dict]:
+    events = []
+    while not events or events[-1]["type"] != event_type:
+        events.append(json.loads(socket.recv(timeout=timeout)))
+    return events
+
+
+def append_pcm(
+    socket, pcm: bytes, chunk: int = 3200, pace_seconds: float = 0.0
+) -> None:
+    for start in range(0, len(pcm), chunk):
+        socket.send(
+            json.dumps(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm[start : start + chunk]).decode(),
+                }
+            )
+        )
+        if pace_seconds > 0.0:
+            time.sleep(pace_seconds)
+        else:
+            pass
+
+
+def update_session(socket, language: str = "en") -> list[dict]:
+    socket.send(
+        json.dumps(
+            {
+                "type": "session.update",
+                "session": {"turn_detection": None, "language": language},
+            }
+        )
+    )
+    return receive_until(socket, "transcription_session.updated")
+
+
+def final_segments(events: list[dict]) -> list[dict]:
+    return [
+        event
+        for event in events
+        if event["type"] == "transcription.segment" and event["is_final"]
+    ]
+
+
+def joined_text(segments: list[dict]) -> str:
+    texts = (segment["text"].strip() for segment in segments)
+    return " ".join(text for text in texts if text)
+
+
+def test_unsupported_realtime_events_keep_the_session_open(server: Server) -> None:
+    with connect(f"ws://127.0.0.1:{server.port}/v1/realtime") as socket:
+        update_session(socket)
+        # Note (VLa1111): clear and server-side items are not part of the manual
+        # turn contract, so they are reported and the session keeps running.
+        for message_type in ("input_audio_buffer.clear", "conversation.item.create"):
+            socket.send(json.dumps({"type": message_type}))
+            event = json.loads(socket.recv())
+            assert event["type"] == "error"
+            assert event["error"]["code"] == "invalid_event"
+            assert event["error"]["message"] == "Unknown event type."
+        assert [event["type"] for event in update_session(socket)] == [
+            "transcription_session.updated"
+        ]
+
+
+def test_realtime_previews_are_replaced_before_the_final(server: Server) -> None:
+    pcm = pcm16("0006_en_short")
+    with connect(f"ws://127.0.0.1:{server.port}/v1/realtime") as socket:
+        update_session(socket)
+        append_pcm(socket, pcm, pace_seconds=0.05)
+        deadline = time.monotonic() + 60.0
+        previews = []
+        while len(previews) < 3 and time.monotonic() < deadline:
+            try:
+                event = json.loads(
+                    socket.recv(timeout=max(deadline - time.monotonic(), 0.1))
+                )
+            except TimeoutError:
+                break
+            assert event["type"] == "transcription.segment"
+            assert event["is_final"] is False
+            previews.append(event)
+        assert len(previews) >= 3, previews
+        socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        socket.send(json.dumps({"type": "transcription.done"}))
+        events = receive_until(socket, "transcription.completed")
+    finals = final_segments(events)
+    assert [segment["text"] for segment in finals] == [events[-1]["text"]]
+    # Note (VLa1111): every preview belongs to the one open segment, and the
+    # text really is replaced as more audio arrives.
+    assert len({preview["segment_id"] for preview in previews}) == 1
+    assert len({preview["text"] for preview in previews}) >= 2
+    first_final = next(
+        index
+        for index, event in enumerate(events)
+        if event["type"] == "transcription.segment" and event["is_final"]
+    )
+    assert all(
+        event["is_final"]
+        for event in events[first_final:]
+        if event["type"] == "transcription.segment"
+    )
+    assert events[-1]["text"].startswith("Surely")
+
+
+def test_realtime_final_text_survives_a_wrong_language_preview(server: Server) -> None:
+    # Note (VLa1111): asking for English makes the early previews of a Chinese
+    # clip translate it; the final must still transcribe the Chinese audio.
+    pcm = pcm16("0153_zh_short")
+    with connect(f"ws://127.0.0.1:{server.port}/v1/realtime") as socket:
+        update_session(socket, language="English")
+        append_pcm(socket, pcm, pace_seconds=0.1)
+        deadline = time.monotonic() + 30.0
+        previews = []
+        while len(previews) < 3 and time.monotonic() < deadline:
+            try:
+                event = json.loads(
+                    socket.recv(timeout=max(deadline - time.monotonic(), 0.1))
+                )
+            except TimeoutError:
+                break
+            if event["type"] == "transcription.segment" and not event["is_final"]:
+                previews.append(event)
+            else:
+                pass
+        assert len(previews) >= 3, previews
+        socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        socket.send(json.dumps({"type": "transcription.done"}))
+        events = receive_until(socket, "transcription.completed")
+    final = events[-1]["text"]
+    assert any("㐀" <= character <= "鿿" for character in final), final
+
+
+def test_repeated_commits_emit_one_final_per_segment(server: Server) -> None:
+    pcm = pcm16("0006_en_short")
+    chunk = 4800
+    with connect(f"ws://127.0.0.1:{server.port}/v1/realtime") as socket:
+        update_session(socket)
+        finals = []
+        for cycle in range(10):
+            if cycle % 2 == 0:
+                append_pcm(socket, pcm[cycle // 2 * chunk : cycle // 2 * chunk + chunk])
+            else:
+                pass
+            socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            # Note (VLa1111): the update response doubles as a barrier, because
+            # the commit is handled before the session update on this socket.
+            cycle_finals = final_segments(update_session(socket))
+            if cycle % 2 == 0:
+                assert len(cycle_finals) == 1
+            else:
+                assert cycle_finals == []
+            finals.extend(cycle_finals)
+        socket.send(json.dumps({"type": "transcription.done"}))
+        completed = receive_until(socket, "transcription.completed")[-1]
+    assert len(finals) == 5
+    assert [segment["segment_id"] for segment in finals] == [0, 1, 2, 3, 4]
+    assert completed["text"] == joined_text(finals)
+
+
+def test_a_closed_realtime_socket_cancels_its_decode(server: Server) -> None:
+    pcm = (pcm16("0344_en_long") * 2)[: 20 * 32000]
+    with connect(f"ws://127.0.0.1:{server.port}/v1/realtime") as socket:
+        update_session(socket)
+        append_pcm(socket, pcm)
+        deadline = time.monotonic() + 30.0
+        while json.loads(server.request("GET", "/health")[1])["request_states"] != {
+            "running": 1
+        }:
+            assert time.monotonic() < deadline, "no realtime decode started"
+            time.sleep(0.05)
+        closed_at = time.monotonic()
+        socket.close()
+        while json.loads(server.request("GET", "/health")[1])["request_states"] != {}:
+            assert (
+                time.monotonic() - closed_at < 1.5
+            ), "the realtime decode kept running after its socket closed"
+            time.sleep(0.05)
+    with connect(f"ws://127.0.0.1:{server.port}/v1/realtime") as socket:
+        update_session(socket)
+        append_pcm(socket, pcm16("0006_en_short"))
+        socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        socket.send(json.dumps({"type": "transcription.done"}))
+        events = receive_until(socket, "transcription.completed")
+    assert events[-1]["text"].startswith("Surely")
+
+
+def test_segments_split_at_the_configured_boundary() -> None:
+    running = Server(flags=("--max-segment-seconds", "1.0"))
+    try:
+        pcm = pcm16("0006_en_short")
+        with connect(f"ws://127.0.0.1:{running.port}/v1/realtime") as socket:
+            update_session(socket)
+            append_pcm(socket, pcm)
+            socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            socket.send(json.dumps({"type": "transcription.done"}))
+            events = receive_until(socket, "transcription.completed")
+    finally:
+        running.stop()
+    finals = final_segments(events)
+    # Note (VLa1111): the 3.05 s clip covers three full segments and a remainder.
+    assert [segment["segment_id"] for segment in finals] == [0, 1, 2, 3]
+    assert events[-1]["text"] == joined_text(finals)
+
+
+def test_pure_silence_finalizes_with_empty_text(server: Server) -> None:
+    with connect(f"ws://127.0.0.1:{server.port}/v1/realtime") as socket:
+        update_session(socket)
+        append_pcm(socket, pcm16("0376_silence"))
+        socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        socket.send(json.dumps({"type": "transcription.done"}))
+        events = receive_until(socket, "transcription.completed")
+    assert [segment["text"] for segment in final_segments(events)] == [""]
+    assert events[-1]["text"] == ""
+
+
+def test_leading_and_trailing_silence_keep_the_transcript(server: Server) -> None:
+    silence = bytes(32000 * 2)
+    pcm = silence + pcm16("0006_en_short") + silence
+    with connect(f"ws://127.0.0.1:{server.port}/v1/realtime") as socket:
+        update_session(socket)
+        append_pcm(socket, pcm)
+        socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        socket.send(json.dumps({"type": "transcription.done"}))
+        events = receive_until(socket, "transcription.completed")
+    assert len(final_segments(events)) == 1
+    assert "thinking" in events[-1]["text"]
+
+
+def test_short_speech_is_finalized(server: Server) -> None:
+    # Note (VLa1111): 100 ms from the middle of the clip, so the peak is speech.
+    pcm = pcm16("0006_en_short")[32000:35200]
+    with connect(f"ws://127.0.0.1:{server.port}/v1/realtime") as socket:
+        update_session(socket)
+        append_pcm(socket, pcm)
+        socket.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        socket.send(json.dumps({"type": "transcription.done"}))
+        events = receive_until(socket, "transcription.completed")
+    finals = final_segments(events)
+    assert len(finals) == 1
+    assert events[-1]["text"] == finals[0]["text"]
+
+
 def test_end_of_stdin_stops_the_server() -> None:
     running = Server()
     running.process.stdin.close()
